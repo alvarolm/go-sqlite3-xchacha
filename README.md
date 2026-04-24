@@ -3,8 +3,11 @@
 An XChaCha20-Poly1305 authenticated-encryption VFS for [ncruces/go-sqlite3](https://github.com/ncruces/go-sqlite3).
 
 > [!CAUTION]
-> - no reviewed, use a your own risk, preffere tested implementations, like https://utelle.github.io/SQLite3MultipleCiphers/
+> - not reviewed, use a your own risk, prefer tested implementations, like https://utelle.github.io/SQLite3MultipleCiphers/
 > - kdf uses constant salt, use raw keys instead
+
+implementations like these are easier to implements thanks to the work of https://github.com/ncruces
+
 
 ## Install
 
