@@ -68,6 +68,7 @@ type auxFile struct {
 	aead     aead
 	role     byte
 	buf      [physBlockSize]byte
+	scratch  [logBlockSize]byte           // reused plaintext scratch for WriteAt
 	aadBuf   [9]byte                      // role || blockNumber_be64
 	ctTagBuf [logBlockSize + tagSize]byte // ct||tag stitching area
 }
@@ -151,29 +152,38 @@ func (f *auxFile) WriteAt(p []byte, off int64) (n int, err error) {
 
 	for ; min < max; min += logBlockSize {
 		blockN := min / logBlockSize
-		var plain [logBlockSize]byte
+		plain := f.scratch[:]
 		full := off <= min && len(p[n:]) >= logBlockSize
 
 		if full {
-			copy(plain[:], p[n:n+logBlockSize])
+			copy(plain, p[n:n+logBlockSize])
 		} else {
-			existing, rerr := f.readBlock(blockN)
-			switch rerr {
-			case nil:
-				copy(plain[:], existing)
-			case io.EOF, io.ErrUnexpectedEOF:
-				// Writing past EOF; plain[] stays zero-initialized.
-			default:
-				return n, rerr
-			}
 			start := int64(0)
 			if off > min {
 				start = off - min
 			}
-			copy(plain[start:], p[n:])
+			writeLen := int64(logBlockSize) - start
+			if writeLen > int64(len(p)-n) {
+				writeLen = int64(len(p) - n)
+			}
+
+			existing, rerr := f.readBlock(blockN)
+			switch rerr {
+			case nil:
+				// readBlock returns f.buf[:logBlockSize]; full overwrite of plain.
+				copy(plain, existing)
+			case io.EOF, io.ErrUnexpectedEOF:
+				// Past EOF: explicitly zero the holes the partial copy won't
+				// touch — buffer reuse means we can't rely on implicit zero-init.
+				clear(plain[:start])
+				clear(plain[start+writeLen:])
+			default:
+				return n, rerr
+			}
+			copy(plain[start:], p[n:n+int(writeLen)])
 		}
 
-		if err := f.sealBlock(blockN, plain[:]); err != nil {
+		if err := f.sealBlock(blockN, plain); err != nil {
 			return n, err
 		}
 
