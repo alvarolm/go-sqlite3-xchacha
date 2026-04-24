@@ -5,18 +5,38 @@
 //
 //	import _ "github.com/alvarolm/go-sqlite3-xchacha"
 //
-// Key material may be supplied via URI parameter or PRAGMA. The recommended
-// flow is PRAGMA, which keeps the key out of the connection string:
+// Key material may be supplied via URI parameter or PRAGMA. With
+// database/sql connection pools the only correct pattern is a per-connection
+// init hook passed to driver.Open — that hook is invoked on EVERY pool
+// connection, so both the reserve_bytes FCNTL and the key PRAGMA are
+// applied uniformly:
 //
-//	db, _ := sql.Open("sqlite3", "file:mydb.db?vfs=xchacha")
-//	// For a NEW database, set reserve_bytes before the first write:
-//	db.Exec(`PRAGMA reserve_bytes = 40`)
-//	db.Exec(`PRAGMA textkey = 'my passphrase'`)
+//	init := func(c *sqlite3.Conn) error {
+//		if err := xchacha.ReserveBytes(c); err != nil { return err }
+//		return c.Exec(`PRAGMA textkey = 'my passphrase'`)
+//	}
+//	db, _ := driver.Open("file:mydb.db?vfs=xchacha", init)
 //
-// For an existing encrypted database, only the key is needed (reserve_bytes is
-// already recorded in the file header):
+// Passing the key through URI parameters (?textkey=/?key=/?hexkey=) does
+// reach every pool connection, but it does NOT install reserve_bytes — so
+// on a NEW database the first connection writes page 1 with header byte 20
+// == 0 and every subsequent pool open fails with NOTADB. URI-based key
+// delivery is only safe against a database that was already created with
+// the init-hook pattern above.
 //
-//	db.Exec(`PRAGMA textkey = 'my passphrase'`)
+// ATTACH-ed databases are keyed independently — each attached main DB has
+// its own key state. The attach URI must carry vfs=xchacha; for an existing
+// encrypted file the key must also be supplied in the URI (SQLite reads
+// page 1 during ATTACH itself, so the empty-file EOF trick used by the
+// primary PRAGMA flow isn't available):
+//
+//	db.Exec(`ATTACH DATABASE 'file:existing.db?vfs=xchacha&textkey=passphrase' AS other`)
+//
+// For a brand-new attached database, PRAGMA-after-ATTACH also works (the
+// file is empty, so the EOF probe succeeds and ATTACH treats it as a new DB):
+//
+//	db.Exec(`ATTACH DATABASE 'file:new.db?vfs=xchacha' AS other`)
+//	db.Exec(`PRAGMA other.textkey = 'new passphrase'`)
 //
 // Supported parameters and pragmas:
 //
@@ -29,14 +49,41 @@
 //   - Main DB pages: XChaCha20-Poly1305 AEAD, 192-bit random nonce per page,
 //     Poly1305 tag, page-number and page-1 header authenticated as AAD.
 //     Tamper-evident at the cipher level.
-//   - Rollback journal / WAL / subjournal: length-preserving XChaCha20 stream
-//     cipher with deterministic per-block nonces (HKDF of byte offset).
-//     Confidential but NOT authenticated; tampering is caught indirectly when
-//     the corrupted data flows back into the main DB on rollback/checkpoint.
+//   - Plaintext header (design choice): bytes 0..100 of page 1 — the SQLite
+//     file header — are stored in the clear and bound as AAD rather than
+//     encrypted. This leaks file metadata (magic string "SQLite format 3\0",
+//     page size, reserve_bytes, file change counter, in-header db size,
+//     freelist/schema cookies, text encoding, user_version, application_id,
+//     SQLite version number, etc.) to anyone with file access. Tampering is
+//     still detected via AAD authentication. This is a deliberate tradeoff:
+//     the "pre-key readable header" is what makes the PRAGMA-after-open flow
+//     work — on a fresh handle, the 100-byte header probe returns EOF while
+//     the file is still empty, so SQLite gives us a chance to receive key
+//     material via PRAGMA textkey/key/hexkey before any page is read; once
+//     data exists, the header is served directly so SQLite can resolve the
+//     page size and reserve_bytes before the key is installed. Upstream
+//     adiantum/xts encrypt the header region at the cost of separate
+//     key-presence state tracking; this VFS does not. If leaking these
+//     metadata fields is unacceptable for your threat model, use upstream
+//     adiantum/xts instead.
+//   - Rollback journal / WAL / subjournal / transient DB: XChaCha20-Poly1305
+//     AEAD per 4096-byte logical block, stored as 4136-byte physical blocks
+//     ([ciphertext | nonce | tag]). 192-bit random nonce per write — aux
+//     ciphertext is non-deterministic across snapshots and tamper-evident at
+//     the cipher level. AAD = role_byte || block_number, so blocks cannot be
+//     swapped across roles (WAL ↔ journal). Same-role cross-file block
+//     replay is NOT prevented and is out of scope here.
+//   - Upgrade note: the aux-file format changed from length-preserving
+//     stream cipher to AEAD with physical block widening. Clean shutdown
+//     (or manual deletion of *-wal / *-journal files) is required before
+//     upgrading. openAux refuses legacy-format aux files with a distinct
+//     error rather than surfacing opaque authentication failures.
 package xchacha
 
 import (
 	"encoding/hex"
+
+	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/ncruces/go-sqlite3"
 	"github.com/ncruces/go-sqlite3/util/vfsutil"
@@ -48,14 +95,19 @@ func init() {
 }
 
 // ReserveBytes is an init hook for driver.Open that configures the database
-// connection's reserve_bytes to the value this VFS requires (40). It is a
-// no-op on existing non-empty databases (per SQLite semantics) and safe to
-// pass unconditionally. Use it when creating a new encrypted database:
+// connection's reserve_bytes to the value this VFS requires (40).
 //
-//	db, err := driver.Open("file:new.db?vfs=xchacha", xchacha.ReserveBytes)
+// Required on EVERY connection when creating a new encrypted database. With
+// database/sql pools, that means passing it (plus the key PRAGMA) via the
+// driver.Open init hook so the setting is applied to every pool connection,
+// not just the first. Skipping it on a create causes page 1 to be written
+// with header byte 20 == 0, and mainDBFile.WriteAt will refuse the write
+// with IOERR_WRITE rather than silently producing a file that every future
+// open rejects with NOTADB.
 //
-// Existing encrypted databases don't need this hook; the value is already
-// stored in file header byte 20.
+// On existing non-empty databases the call is a no-op (SQLite reads
+// reserve_bytes from the file header), so the hook is safe to pass
+// unconditionally.
 func ReserveBytes(conn *sqlite3.Conn) error {
 	_, err := conn.FileControl("main", sqlite3.FCNTL_RESERVE_BYTES, int(reserveBytes))
 	return err
@@ -123,9 +175,13 @@ func (v *xchachaVFS) openMainDB(name *vfs.Filename, file vfs.File, flags vfs.Ope
 	var key []byte
 	if name != nil {
 		params := name.URIParameters()
-		if t, ok := params["key"]; ok && len(t[0]) > 0 {
+		// key / hexkey accept empty values and fall through to setKey, which
+		// surfaces IOERR_BADKEY via Keys' length check — matches upstream
+		// adiantum. textkey keeps the len>0 guard so an empty textkey= stays
+		// PRAGMA-deferred rather than being KDF'd into a random 32-byte key.
+		if t, ok := params["key"]; ok {
 			key = []byte(t[0])
-		} else if t, ok := params["hexkey"]; ok && len(t[0]) > 0 {
+		} else if t, ok := params["hexkey"]; ok {
 			key, _ = hex.DecodeString(t[0])
 		} else if t, ok := params["textkey"]; ok && len(t[0]) > 0 {
 			key = v.init.KDF(t[0])
@@ -142,13 +198,28 @@ func (v *xchachaVFS) openMainDB(name *vfs.Filename, file vfs.File, flags vfs.Ope
 }
 
 // openAux handles journal / WAL / subjournal / transient DB. Key material is
-// looked up from the associated main DB via vfsutil.UnwrapFile; if none is
-// available (standalone temp/transient file), a random aux key is generated.
+// looked up from the associated main DB via vfsutil.UnwrapFile; if the main
+// DB is ours but has not yet received a key, we refuse rather than silently
+// writing under an unrecoverable random key. For truly standalone aux files
+// (no associated main DB) a random aux key is generated.
+//
+// Also probes for legacy length-preserving aux files on disk (size multiple
+// of 4096 but not 4136) and refuses with a distinct error rather than a
+// generic IOERR_DATA on first read.
 func (v *xchachaVFS) openAux(name *vfs.Filename, file vfs.File, flags vfs.OpenFlag) (vfs.File, vfs.OpenFlag, error) {
-	var auxKey []byte
+	if sz, szErr := file.Size(); szErr == nil && sz > 0 &&
+		sz%physBlockSize != 0 && sz%logBlockSize == 0 {
+		file.Close()
+		return nil, flags, sqlite3.IOERR
+	}
 
+	var auxKey []byte
 	if name != nil {
-		if main, ok := vfsutil.UnwrapFile[*mainDBFile](name.DatabaseFile()); ok && main.auxKey != nil {
+		if main, ok := vfsutil.UnwrapFile[*mainDBFile](name.DatabaseFile()); ok {
+			if main.auxKey == nil {
+				file.Close()
+				return nil, flags, sqlite3.IOERR_BADKEY
+			}
 			auxKey = main.auxKey
 		}
 	}
@@ -165,5 +236,10 @@ func (v *xchachaVFS) openAux(name *vfs.Filename, file vfs.File, flags vfs.OpenFl
 		auxKey = aux
 	}
 
-	return &auxFile{File: file, auxKey: auxKey}, flags, nil
+	a, err := chacha20poly1305.NewX(auxKey)
+	if err != nil {
+		file.Close()
+		return nil, flags, sqlite3.IOERR_BADKEY
+	}
+	return &auxFile{File: file, aead: a, role: auxRoleFromFlags(flags)}, flags, nil
 }

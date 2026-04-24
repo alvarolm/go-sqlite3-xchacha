@@ -12,7 +12,11 @@ import (
 )
 
 const (
-	headerPlaintext = 100 // first N bytes of page 1 that stay plaintext (the SQLite header)
+	// headerPlaintext is the size of the SQLite database file header (bytes
+	// 0-99 of page 1) that SQLite reads before any key can be installed,
+	// so we must leave it readable. Those bytes are authenticated as AAD,
+	// not encrypted. Fixed by SQLite's file format — see btree.c zDbHeader.
+	headerPlaintext = 100
 )
 
 // mainDBFile wraps the OPEN_MAIN_DB (and OPEN_TEMP_DB) file with per-page
@@ -22,10 +26,24 @@ const (
 // If aead is nil, the file is awaiting key material via PRAGMA textkey/key/hexkey.
 type mainDBFile struct {
 	vfs.File
-	init   Creator
-	aead   aead   // XChaCha20-Poly1305 on main_key
-	auxKey []byte // HKDF(main_key, "xchacha-aux-v1")
-	buf    [pageSize]byte
+	init     Creator
+	aead     aead   // XChaCha20-Poly1305 on main_key
+	auxKey   []byte // HKDF(main_key, "xchacha-aux-v1")
+	buf      [pageSize]byte
+	aadBuf   [8 + headerPlaintext]byte    // AAD scratch; pageNum || (page-1 header)
+	ctTagBuf [usablePerPage + tagSize]byte // ct||tag stitching area
+}
+
+// aad builds the AAD for a page into f.aadBuf and returns the valid slice.
+// The returned slice is reused across calls — caller must hand it to
+// Seal/Open before the next aad() call.
+func (f *mainDBFile) aad(pageNum uint64) []byte {
+	binary.BigEndian.PutUint64(f.aadBuf[:8], pageNum)
+	if pageNum == 1 {
+		copy(f.aadBuf[8:], f.buf[:headerPlaintext])
+		return f.aadBuf[:8+headerPlaintext]
+	}
+	return f.aadBuf[:8]
 }
 
 // setKey derives and installs the main AEAD + aux subkey. Returns an sqlite3
@@ -46,11 +64,13 @@ func (f *mainDBFile) setKey(key []byte) error {
 			return rerr
 		}
 		// Byte 20 = reserved bytes; bytes 16-17 = page size (1 means 65536).
+		// Format mismatches surface as NOTADB so callers can distinguish a
+		// wrong-key error (IOERR_BADKEY) from "this isn't an xchacha DB."
 		if ps := binary.BigEndian.Uint16(hdr[16:18]); ps != pageSize && !(ps == 1 && pageSize == 65536) {
-			return sqlite3.IOERR_BADKEY
+			return sqlite3.NOTADB
 		}
 		if hdr[20] != reserveBytes {
-			return sqlite3.IOERR_BADKEY
+			return sqlite3.NOTADB
 		}
 	}
 	f.aead = a
@@ -136,39 +156,33 @@ func (f *mainDBFile) ReadAt(p []byte, off int64) (n int, err error) {
 // decryptPage decrypts f.buf in place and returns the plaintext slice of length
 // pageSize. For page 1, the first 100 bytes are passed through as plaintext
 // and authenticated as AAD along with the page number.
+//
+// Zero-alloc path (modulo the x/crypto XChaCha20-Poly1305 internals that
+// allocate a subkey AEAD + 96-bit nonce per Open — unavoidable from this
+// layer). Uses struct-resident scratch buffers: f.ctTagBuf for the stitched
+// ciphertext||tag, f.aadBuf for AAD.
 func (f *mainDBFile) decryptPage(pageNum uint64) ([]byte, error) {
-	var pageNumBuf [8]byte
-	binary.BigEndian.PutUint64(pageNumBuf[:], pageNum)
-
 	nonce := f.buf[usablePerPage : usablePerPage+nonceSize]
-	// ciphertext = f.buf[:usablePerPage] for pages >= 2
-	// for page 1, ciphertext = f.buf[headerPlaintext:usablePerPage] with AAD including header.
 	tagStart := usablePerPage + nonceSize
 
-	var aad []byte
 	var ctStart int
 	if pageNum == 1 {
-		aad = append(append([]byte(nil), pageNumBuf[:]...), f.buf[:headerPlaintext]...)
 		ctStart = headerPlaintext
-	} else {
-		aad = pageNumBuf[:]
-		ctStart = 0
 	}
+	ctLen := usablePerPage - ctStart
 
-	// Build contiguous ciphertext||tag buffer for Open.
-	ciphertext := f.buf[ctStart:usablePerPage]
-	tag := f.buf[tagStart:pageSize]
-	ctAndTag := make([]byte, 0, len(ciphertext)+tagSize)
-	ctAndTag = append(ctAndTag, ciphertext...)
-	ctAndTag = append(ctAndTag, tag...)
+	// Stitch ciphertext || tag into the scratch buffer so Open has them
+	// contiguous. On-disk layout is [ct | nonce | tag] — the nonce sits
+	// between the two pieces Open needs.
+	copy(f.ctTagBuf[:ctLen], f.buf[ctStart:usablePerPage])
+	copy(f.ctTagBuf[ctLen:ctLen+tagSize], f.buf[tagStart:pageSize])
 
-	plain, err := f.aead.Open(nil, nonce, ctAndTag, aad)
-	if err != nil {
+	// In-place decrypt back into the ct region of f.buf. dst = f.buf[ctStart:ctStart]
+	// with cap reaching usablePerPage; Open writes ctLen bytes of plaintext.
+	if _, err := f.aead.Open(f.buf[ctStart:ctStart], nonce, f.ctTagBuf[:ctLen+tagSize], f.aad(pageNum)); err != nil {
 		return nil, sqlite3.IOERR_DATA
 	}
-	copy(f.buf[ctStart:], plain)
-	// Zero the reserved tail in the returned plaintext view so SQLite doesn't
-	// mistake nonce bytes for data.
+	// Zero the reserved tail so SQLite doesn't see nonce bytes as data.
 	for i := usablePerPage; i < pageSize; i++ {
 		f.buf[i] = 0
 	}
@@ -190,33 +204,35 @@ func (f *mainDBFile) WriteAt(p []byte, off int64) (n int, err error) {
 		pageNum := uint64(page/pageSize) + 1
 
 		// Copy the plaintext page into our buffer; we own the reserve tail.
+		// Must happen BEFORE f.aad(pageNum) so page 1's AAD captures the
+		// caller's (new) header, not leftover bytes from a previous op.
 		copy(f.buf[:], p[n:n+pageSize])
 
-		var pageNumBuf [8]byte
-		binary.BigEndian.PutUint64(pageNumBuf[:], pageNum)
-
-		var aad []byte
 		var ptStart int
 		if pageNum == 1 {
-			aad = append(append([]byte(nil), pageNumBuf[:]...), f.buf[:headerPlaintext]...)
 			ptStart = headerPlaintext
-		} else {
-			aad = pageNumBuf[:]
-			ptStart = 0
+			// SQLite writes reserve_bytes into header byte 20. If the
+			// connection didn't configure it (missing ReserveBytes init hook
+			// on create), byte 20 is 0 and this page would poison the file —
+			// every future open would hit NOTADB in setKey. Fail loud at the
+			// first write instead of silently creating a malformed file.
+			if f.buf[20] != reserveBytes {
+				return n, sqlite3.IOERR_WRITE
+			}
 		}
 
-		nonce := make([]byte, nonceSize)
-		if _, err := rand.Read(nonce); err != nil {
+		// Generate nonce directly into its on-disk slot.
+		if _, err := rand.Read(f.buf[usablePerPage : usablePerPage+nonceSize]); err != nil {
 			return n, err
 		}
+		nonce := f.buf[usablePerPage : usablePerPage+nonceSize]
 
-		// Seal(plaintext) → ciphertext||tag.
+		// Seal into the struct scratch buffer; split ct and tag back into f.buf.
 		plaintext := f.buf[ptStart:usablePerPage]
-		sealed := f.aead.Seal(nil, nonce, plaintext, aad)
-		// sealed = ciphertext (len==plaintext) || tag (16)
-		copy(f.buf[ptStart:usablePerPage], sealed[:len(plaintext)])
-		copy(f.buf[usablePerPage:usablePerPage+nonceSize], nonce)
-		copy(f.buf[usablePerPage+nonceSize:pageSize], sealed[len(plaintext):])
+		sealed := f.aead.Seal(f.ctTagBuf[:0], nonce, plaintext, f.aad(pageNum))
+		ctLen := len(plaintext)
+		copy(f.buf[ptStart:usablePerPage], sealed[:ctLen])
+		copy(f.buf[usablePerPage+nonceSize:pageSize], sealed[ctLen:])
 
 		m, werr := f.File.WriteAt(f.buf[:], page)
 		if m != pageSize {
@@ -236,11 +252,7 @@ func (f *mainDBFile) Truncate(size int64) error {
 }
 
 func (f *mainDBFile) SectorSize() int {
-	s := f.File.SectorSize()
-	if s < pageSize {
-		return pageSize
-	}
-	if s%pageSize == 0 {
+	if s := lcm(f.File.SectorSize(), pageSize); s > 0 {
 		return s
 	}
 	return pageSize
@@ -261,8 +273,8 @@ func (f *mainDBFile) SizeHint(size int64) error { return vfsutil.WrapSizeHint(f.
 func (f *mainDBFile) Unwrap() vfs.File           { return f.File }
 func (f *mainDBFile) SharedMemory() vfs.SharedMemory { return vfsutil.WrapSharedMemory(f.File) }
 func (f *mainDBFile) LockState() vfs.LockLevel   { return vfsutil.WrapLockState(f.File) }
-func (f *mainDBFile) PersistentWAL() bool        { return vfsutil.WrapPersistWAL(f.File) }
-func (f *mainDBFile) SetPersistentWAL(keep bool) { vfsutil.WrapSetPersistWAL(f.File, keep) }
+func (f *mainDBFile) PersistWAL() bool        { return vfsutil.WrapPersistWAL(f.File) }
+func (f *mainDBFile) SetPersistWAL(keep bool) { vfsutil.WrapSetPersistWAL(f.File, keep) }
 func (f *mainDBFile) HasMoved() (bool, error)    { return vfsutil.WrapHasMoved(f.File) }
 func (f *mainDBFile) Overwrite() error           { return vfsutil.WrapOverwrite(f.File) }
 func (f *mainDBFile) SyncSuper(s string) error   { return vfsutil.WrapSyncSuper(f.File, s) }

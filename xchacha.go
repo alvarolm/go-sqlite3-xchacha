@@ -35,9 +35,6 @@ const (
 
 	// auxHKDFInfoKey domain-separates the aux subkey from the main key.
 	auxHKDFInfoKey = "xchacha-aux-v1"
-
-	// auxHKDFInfoNonce domain-separates per-block aux nonces.
-	auxHKDFInfoNonce = "xchacha-aux-nonce-v1"
 )
 
 // Creator produces an XChaCha20-Poly1305 AEAD and aux key given raw key material.
@@ -72,6 +69,19 @@ func (xchachaCreator) KDF(text string) []byte {
 	return argon2.IDKey([]byte(text), []byte(pepper), 3, 64*1024, 4, keySize)
 }
 
+// lcm returns the least common multiple of a and b, or 0 if either is <= 0.
+// Used by SectorSize to align the base VFS sector size with our crypto block.
+func lcm(a, b int) int {
+	if a <= 0 || b <= 0 {
+		return 0
+	}
+	g := a
+	for n := b; n != 0; {
+		g, n = n, g%n
+	}
+	return a / g * b
+}
+
 func (xchachaCreator) Keys(key []byte) (aead, []byte) {
 	if len(key) != keySize {
 		return nil, nil
@@ -88,20 +98,3 @@ func (xchachaCreator) Keys(key []byte) (aead, []byte) {
 	return a, aux
 }
 
-// deriveAuxNonce produces a deterministic 24-byte XChaCha20 nonce for the
-// 4096-byte aux-file block starting at byte offset blockStart.
-// Deterministic because aux files are length-preserving — no room to store
-// per-block random nonces inline. Domain-separated from the main key via HKDF.
-func deriveAuxNonce(auxKey []byte, blockStart int64) (nonce [nonceSize]byte) {
-	var salt [8]byte
-	// big-endian offset as salt keeps the HKDF expand deterministic and ordered.
-	for i := 7; i >= 0; i-- {
-		salt[i] = byte(blockStart)
-		blockStart >>= 8
-	}
-	r := hkdf.New(sha256.New, auxKey, salt[:], []byte(auxHKDFInfoNonce))
-	if _, err := io.ReadFull(r, nonce[:]); err != nil {
-		panic(err)
-	}
-	return nonce
-}

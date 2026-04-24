@@ -1,52 +1,142 @@
 package xchacha
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"io"
 
-	"golang.org/x/crypto/chacha20"
-
+	"github.com/ncruces/go-sqlite3"
 	"github.com/ncruces/go-sqlite3/util/vfsutil"
 	"github.com/ncruces/go-sqlite3/vfs"
 )
 
-const auxBlockSize = pageSize
+// logBlockSize is the plaintext block unit the wrapper presents to SQLite.
+// Chosen to match the main-DB page size so aux files (WAL / journal /
+// subjournal / transient DB) share an encryption block with a page.
+const logBlockSize = pageSize
 
-func auxRoundDown(i int64) int64 { return i &^ (auxBlockSize - 1) }
-func auxRoundUp[T int | int64](i T) T {
-	return (i + (auxBlockSize - 1)) &^ (auxBlockSize - 1)
+// physBlockSize is the on-disk block size: logical block + nonce + tag.
+// Per-block layout on disk: [ciphertext(logBlockSize) | nonce(nonceSize) | tag(tagSize)].
+const physBlockSize = logBlockSize + reserveBytes
+
+func logRoundDown(i int64) int64 { return i &^ (logBlockSize - 1) }
+func logRoundUp[T int | int64](i T) T {
+	return (i + (logBlockSize - 1)) &^ (logBlockSize - 1)
+}
+func physRoundUp[T int | int64](i T) T {
+	return (logRoundUp(i) / logBlockSize) * physBlockSize
+}
+
+func physBlockOff(blockN int64) int64 { return blockN * physBlockSize }
+
+// Aux-file roles. One byte per role is folded into the AEAD AAD alongside the
+// block number, so blocks cannot be swapped across roles without failing
+// authentication. Cross-file replay within the same role is NOT prevented;
+// closing that would require a per-file random salt in a file prologue.
+const (
+	auxRoleJournal     byte = 0x01 // OPEN_MAIN_JOURNAL
+	auxRoleWAL         byte = 0x02 // OPEN_WAL
+	auxRoleSubjournal  byte = 0x03 // OPEN_SUBJOURNAL
+	auxRoleTempJournal byte = 0x04 // OPEN_TEMP_JOURNAL
+	auxRoleTransient   byte = 0x05 // OPEN_TRANSIENT_DB / unknown
+)
+
+func auxRoleFromFlags(flags vfs.OpenFlag) byte {
+	switch {
+	case flags&vfs.OPEN_WAL != 0:
+		return auxRoleWAL
+	case flags&vfs.OPEN_MAIN_JOURNAL != 0:
+		return auxRoleJournal
+	case flags&vfs.OPEN_SUBJOURNAL != 0:
+		return auxRoleSubjournal
+	case flags&vfs.OPEN_TEMP_JOURNAL != 0:
+		return auxRoleTempJournal
+	default:
+		return auxRoleTransient
+	}
 }
 
 // auxFile wraps rollback journal / WAL / subjournal / transient-DB / temp files
-// with length-preserving XChaCha20 stream-cipher encryption. Nonce per 4 KiB
-// block is derived deterministically from byte offset via HKDF — which leaks
-// ciphertext equality at the same offset across snapshots, same as adiantum/xts.
+// with per-block XChaCha20-Poly1305 AEAD. Every 4096-byte logical block becomes
+// a 4136-byte physical block on disk; offsets are translated at the VFS layer
+// and Size() reports the logical size so SQLite still sees block-aligned files.
+//
+// Fresh random 24-byte nonces are generated per write, so ciphertext is
+// non-deterministic across snapshots. AAD = role_byte || blockNumber_be64.
 type auxFile struct {
 	vfs.File
-	auxKey []byte
-	block  [auxBlockSize]byte
+	aead     aead
+	role     byte
+	buf      [physBlockSize]byte
+	aadBuf   [9]byte                      // role || blockNumber_be64
+	ctTagBuf [logBlockSize + tagSize]byte // ct||tag stitching area
 }
 
-func (f *auxFile) xor(block []byte, blockStart int64) {
-	nonce := deriveAuxNonce(f.auxKey, blockStart)
-	c, err := chacha20.NewUnauthenticatedCipher(f.auxKey, nonce[:])
-	if err != nil {
-		panic(err)
+// aad builds the AAD for a block into f.aadBuf and returns the valid slice.
+// Reused across calls; caller must hand it to Seal/Open before the next aad().
+func (f *auxFile) aad(blockN int64) []byte {
+	f.aadBuf[0] = f.role
+	binary.BigEndian.PutUint64(f.aadBuf[1:], uint64(blockN))
+	return f.aadBuf[:]
+}
+
+// readBlock reads the physical block for blockN, decrypts it, and returns the
+// plaintext. Returns io.EOF (or io.ErrUnexpectedEOF) if the block isn't on
+// disk, sqlite3.IOERR_DATA on authentication failure, or any other lower-level
+// read error unchanged.
+//
+// Zero-alloc path (modulo x/crypto XChaCha20-Poly1305 internals — subkey AEAD
+// and 96-bit nonce per Open, unavoidable from this layer). Uses f.ctTagBuf
+// for the ct||tag scratch; plaintext lands in f.buf[:logBlockSize].
+func (f *auxFile) readBlock(blockN int64) ([]byte, error) {
+	m, rerr := f.File.ReadAt(f.buf[:], physBlockOff(blockN))
+	if m != physBlockSize {
+		if rerr == nil {
+			rerr = io.ErrUnexpectedEOF
+		}
+		return nil, rerr
 	}
-	c.XORKeyStream(block, block)
+	nonce := f.buf[logBlockSize : logBlockSize+nonceSize]
+	copy(f.ctTagBuf[:logBlockSize], f.buf[:logBlockSize])
+	copy(f.ctTagBuf[logBlockSize:], f.buf[logBlockSize+nonceSize:physBlockSize])
+	if _, err := f.aead.Open(f.buf[:0], nonce, f.ctTagBuf[:logBlockSize+tagSize], f.aad(blockN)); err != nil {
+		return nil, sqlite3.IOERR_DATA
+	}
+	return f.buf[:logBlockSize], nil
+}
+
+// sealBlock encrypts plain (logBlockSize bytes) with a fresh random nonce and
+// writes the resulting physical block to disk at physBlockOff(blockN).
+func (f *auxFile) sealBlock(blockN int64, plain []byte) error {
+	if _, err := rand.Read(f.buf[logBlockSize : logBlockSize+nonceSize]); err != nil {
+		return err
+	}
+	nonce := f.buf[logBlockSize : logBlockSize+nonceSize]
+	sealed := f.aead.Seal(f.ctTagBuf[:0], nonce, plain, f.aad(blockN))
+	// sealed = ciphertext(logBlockSize) || tag(tagSize).
+	copy(f.buf[:logBlockSize], sealed[:logBlockSize])
+	copy(f.buf[logBlockSize+nonceSize:physBlockSize], sealed[logBlockSize:])
+	m, werr := f.File.WriteAt(f.buf[:], physBlockOff(blockN))
+	if m != physBlockSize {
+		return werr
+	}
+	return nil
 }
 
 func (f *auxFile) ReadAt(p []byte, off int64) (n int, err error) {
-	min := auxRoundDown(off)
-	max := auxRoundUp(off + int64(len(p)))
+	min := logRoundDown(off)
+	max := logRoundUp(off + int64(len(p)))
 
-	for ; min < max; min += auxBlockSize {
-		m, err := f.File.ReadAt(f.block[:], min)
-		if m != auxBlockSize {
-			return n, err
+	for ; min < max; min += logBlockSize {
+		blockN := min / logBlockSize
+		plain, rerr := f.readBlock(blockN)
+		if rerr != nil {
+			if n == 0 && (rerr == io.EOF || rerr == io.ErrUnexpectedEOF) {
+				return 0, io.EOF
+			}
+			return n, rerr
 		}
-		f.xor(f.block[:], min)
-
-		data := f.block[:]
+		data := plain
 		if off > min {
 			data = data[off-min:]
 		}
@@ -56,83 +146,103 @@ func (f *auxFile) ReadAt(p []byte, off int64) (n int, err error) {
 }
 
 func (f *auxFile) WriteAt(p []byte, off int64) (n int, err error) {
-	min := auxRoundDown(off)
-	max := auxRoundUp(off + int64(len(p)))
+	min := logRoundDown(off)
+	max := logRoundUp(off + int64(len(p)))
 
-	for ; min < max; min += auxBlockSize {
-		data := f.block[:]
-		full := off <= min && len(p[n:]) >= auxBlockSize
+	for ; min < max; min += logBlockSize {
+		blockN := min / logBlockSize
+		var plain [logBlockSize]byte
+		full := off <= min && len(p[n:]) >= logBlockSize
 
-		if !full {
-			// Partial block: read-decrypt-modify-encrypt-write.
-			m, rerr := f.File.ReadAt(f.block[:], min)
-			if m == auxBlockSize {
-				f.xor(f.block[:], min)
-			} else if rerr != io.EOF {
+		if full {
+			copy(plain[:], p[n:n+logBlockSize])
+		} else {
+			existing, rerr := f.readBlock(blockN)
+			switch rerr {
+			case nil:
+				copy(plain[:], existing)
+			case io.EOF, io.ErrUnexpectedEOF:
+				// Writing past EOF; plain[] stays zero-initialized.
+			default:
 				return n, rerr
-			} else {
-				// Writing past EOF; zero-pad.
-				clear(data)
 			}
+			start := int64(0)
 			if off > min {
-				data = data[off-min:]
+				start = off - min
 			}
+			copy(plain[start:], p[n:])
 		}
 
-		t := copy(data, p[n:])
-		f.xor(f.block[:], min)
-
-		m, werr := f.File.WriteAt(f.block[:], min)
-		if m != auxBlockSize {
-			return n, werr
+		if err := f.sealBlock(blockN, plain[:]); err != nil {
+			return n, err
 		}
-		n += t
+
+		if full {
+			n += logBlockSize
+		} else {
+			start := int64(0)
+			if off > min {
+				start = off - min
+			}
+			consumed := int64(logBlockSize) - start
+			if consumed > int64(len(p)-n) {
+				consumed = int64(len(p) - n)
+			}
+			n += int(consumed)
+		}
 	}
 	return n, nil
 }
 
 func (f *auxFile) Truncate(size int64) error {
-	return f.File.Truncate(auxRoundUp(size))
+	return f.File.Truncate(physRoundUp(size))
+}
+
+// Size translates the physical on-disk size back to what SQLite expects
+// (multiples of logBlockSize). A trailing partial block from an interrupted
+// write is floored out — SQLite's WAL recovery trusts mxFrame in the header
+// over file size, so trailing garbage is harmless.
+func (f *auxFile) Size() (int64, error) {
+	phys, err := f.File.Size()
+	if err != nil {
+		return 0, err
+	}
+	blocks := phys / physBlockSize
+	return blocks * logBlockSize, nil
 }
 
 func (f *auxFile) SectorSize() int {
-	s := f.File.SectorSize()
-	if s < auxBlockSize {
-		return auxBlockSize
-	}
-	// LCM-ish: pick the smaller of "base rounded up" or auxBlockSize multiple.
-	if s%auxBlockSize == 0 {
+	if s := lcm(f.File.SectorSize(), logBlockSize); s > 0 {
 		return s
 	}
-	return auxBlockSize
+	return logBlockSize
 }
 
 func (f *auxFile) DeviceCharacteristics() vfs.DeviceCharacteristic {
+	// Strip IOCAP_ATOMIC4K and IOCAP_BATCH_ATOMIC: physical blocks are 4136 B,
+	// so the underlying FS cannot atomically write one block.
 	return f.File.DeviceCharacteristics() & (0 |
-		vfs.IOCAP_ATOMIC4K |
 		vfs.IOCAP_IMMUTABLE |
 		vfs.IOCAP_SEQUENTIAL |
 		vfs.IOCAP_SUBPAGE_READ |
-		vfs.IOCAP_BATCH_ATOMIC |
 		vfs.IOCAP_UNDELETABLE_WHEN_OPEN)
 }
 
-func (f *auxFile) ChunkSize(size int)          { vfsutil.WrapChunkSize(f.File, auxRoundUp(size)) }
-func (f *auxFile) SizeHint(size int64) error   { return vfsutil.WrapSizeHint(f.File, auxRoundUp(size)) }
+func (f *auxFile) ChunkSize(size int)                 { vfsutil.WrapChunkSize(f.File, physRoundUp(size)) }
+func (f *auxFile) SizeHint(size int64) error          { return vfsutil.WrapSizeHint(f.File, physRoundUp(size)) }
 func (f *auxFile) Pragma(n, v string) (string, error) { return vfsutil.WrapPragma(f.File, n, v) }
-func (f *auxFile) Unwrap() vfs.File             { return f.File }
-func (f *auxFile) SharedMemory() vfs.SharedMemory { return vfsutil.WrapSharedMemory(f.File) }
-func (f *auxFile) LockState() vfs.LockLevel     { return vfsutil.WrapLockState(f.File) }
-func (f *auxFile) PersistentWAL() bool          { return vfsutil.WrapPersistWAL(f.File) }
-func (f *auxFile) SetPersistentWAL(keep bool)   { vfsutil.WrapSetPersistWAL(f.File, keep) }
-func (f *auxFile) HasMoved() (bool, error)      { return vfsutil.WrapHasMoved(f.File) }
-func (f *auxFile) Overwrite() error             { return vfsutil.WrapOverwrite(f.File) }
-func (f *auxFile) SyncSuper(s string) error     { return vfsutil.WrapSyncSuper(f.File, s) }
-func (f *auxFile) CommitPhaseTwo() error        { return vfsutil.WrapCommitPhaseTwo(f.File) }
-func (f *auxFile) BeginAtomicWrite() error      { return vfsutil.WrapBeginAtomicWrite(f.File) }
-func (f *auxFile) CommitAtomicWrite() error     { return vfsutil.WrapCommitAtomicWrite(f.File) }
-func (f *auxFile) RollbackAtomicWrite() error   { return vfsutil.WrapRollbackAtomicWrite(f.File) }
-func (f *auxFile) CheckpointStart()             { vfsutil.WrapCheckpointStart(f.File) }
-func (f *auxFile) CheckpointDone()              { vfsutil.WrapCheckpointDone(f.File) }
-func (f *auxFile) BusyHandler(h func() bool)    { vfsutil.WrapBusyHandler(f.File, h) }
-
+func (f *auxFile) Unwrap() vfs.File                   { return f.File }
+func (f *auxFile) SharedMemory() vfs.SharedMemory     { return vfsutil.WrapSharedMemory(f.File) }
+func (f *auxFile) LockState() vfs.LockLevel           { return vfsutil.WrapLockState(f.File) }
+func (f *auxFile) PersistWAL() bool                   { return vfsutil.WrapPersistWAL(f.File) }
+func (f *auxFile) SetPersistWAL(keep bool)            { vfsutil.WrapSetPersistWAL(f.File, keep) }
+func (f *auxFile) HasMoved() (bool, error)            { return vfsutil.WrapHasMoved(f.File) }
+func (f *auxFile) Overwrite() error                   { return vfsutil.WrapOverwrite(f.File) }
+func (f *auxFile) SyncSuper(s string) error           { return vfsutil.WrapSyncSuper(f.File, s) }
+func (f *auxFile) CommitPhaseTwo() error              { return vfsutil.WrapCommitPhaseTwo(f.File) }
+func (f *auxFile) BeginAtomicWrite() error            { return vfsutil.WrapBeginAtomicWrite(f.File) }
+func (f *auxFile) CommitAtomicWrite() error           { return vfsutil.WrapCommitAtomicWrite(f.File) }
+func (f *auxFile) RollbackAtomicWrite() error         { return vfsutil.WrapRollbackAtomicWrite(f.File) }
+func (f *auxFile) CheckpointStart()                   { vfsutil.WrapCheckpointStart(f.File) }
+func (f *auxFile) CheckpointDone()                    { vfsutil.WrapCheckpointDone(f.File) }
+func (f *auxFile) BusyHandler(h func() bool)          { vfsutil.WrapBusyHandler(f.File, h) }
