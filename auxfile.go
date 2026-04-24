@@ -68,9 +68,9 @@ type auxFile struct {
 	aead     aead
 	role     byte
 	buf      [physBlockSize]byte
-	scratch  [logBlockSize]byte           // reused plaintext scratch for WriteAt
-	aadBuf   [9]byte                      // role || blockNumber_be64
-	ctTagBuf [logBlockSize + tagSize]byte // ct||tag stitching area
+	scratch  [logBlockSize]byte // reused plaintext scratch for WriteAt
+	aadBuf   [9]byte            // role || blockNumber_be64
+	nonceBuf [nonceSize]byte    // nonce scratch — sealBlock generates here, readBlock saves here
 }
 
 // aad builds the AAD for a block into f.aadBuf and returns the valid slice.
@@ -87,8 +87,10 @@ func (f *auxFile) aad(blockN int64) []byte {
 // read error unchanged.
 //
 // Zero-alloc path (modulo x/crypto XChaCha20-Poly1305 internals — subkey AEAD
-// and 96-bit nonce per Open, unavoidable from this layer). Uses f.ctTagBuf
-// for the ct||tag scratch; plaintext lands in f.buf[:logBlockSize].
+// and 96-bit nonce per Open, unavoidable from this layer). Decrypts in place
+// inside f.buf using the cipher.AEAD documented ciphertext[:0] form: the
+// nonce is saved off, the tag is moved down to be contiguous with the
+// ciphertext, then Open writes plaintext over the ciphertext region.
 func (f *auxFile) readBlock(blockN int64) ([]byte, error) {
 	m, rerr := f.File.ReadAt(f.buf[:], physBlockOff(blockN))
 	if m != physBlockSize {
@@ -97,10 +99,15 @@ func (f *auxFile) readBlock(blockN int64) ([]byte, error) {
 		}
 		return nil, rerr
 	}
-	nonce := f.buf[logBlockSize : logBlockSize+nonceSize]
-	copy(f.ctTagBuf[:logBlockSize], f.buf[:logBlockSize])
-	copy(f.ctTagBuf[logBlockSize:], f.buf[logBlockSize+nonceSize:physBlockSize])
-	if _, err := f.aead.Open(f.buf[:0], nonce, f.ctTagBuf[:logBlockSize+tagSize], f.aad(blockN)); err != nil {
+	// Save the nonce before the tag move clobbers part of its slot.
+	copy(f.nonceBuf[:], f.buf[logBlockSize:logBlockSize+nonceSize])
+	// Move the tag down so f.buf[:logBlockSize+tagSize] = ct||tag. Source
+	// [logBlockSize+nonceSize : physBlockSize] and destination
+	// [logBlockSize : logBlockSize+tagSize] do not overlap (gap at
+	// [logBlockSize+tagSize : logBlockSize+nonceSize]); plain copy() is safe.
+	copy(f.buf[logBlockSize:logBlockSize+tagSize], f.buf[logBlockSize+nonceSize:physBlockSize])
+	ct := f.buf[:logBlockSize+tagSize]
+	if _, err := f.aead.Open(ct[:0], f.nonceBuf[:], ct, f.aad(blockN)); err != nil {
 		return nil, sqlite3.IOERR_DATA
 	}
 	return f.buf[:logBlockSize], nil
@@ -108,15 +115,24 @@ func (f *auxFile) readBlock(blockN int64) ([]byte, error) {
 
 // sealBlock encrypts plain (logBlockSize bytes) with a fresh random nonce and
 // writes the resulting physical block to disk at physBlockOff(blockN).
+//
+// Seals directly into f.buf to avoid the 4 KB ciphertext memcpy. Seal writes
+// ct(logBlockSize) || tag(tagSize) starting at f.buf[0]; we then move the tag
+// to its on-disk slot at the end and place the nonce in the middle. Ordering
+// matters: the tag move must read from [logBlockSize : logBlockSize+tagSize]
+// before the nonce write overwrites that range.
 func (f *auxFile) sealBlock(blockN int64, plain []byte) error {
-	if _, err := rand.Read(f.buf[logBlockSize : logBlockSize+nonceSize]); err != nil {
+	if _, err := rand.Read(f.nonceBuf[:]); err != nil {
 		return err
 	}
-	nonce := f.buf[logBlockSize : logBlockSize+nonceSize]
-	sealed := f.aead.Seal(f.ctTagBuf[:0], nonce, plain, f.aad(blockN))
-	// sealed = ciphertext(logBlockSize) || tag(tagSize).
-	copy(f.buf[:logBlockSize], sealed[:logBlockSize])
-	copy(f.buf[logBlockSize+nonceSize:physBlockSize], sealed[logBlockSize:])
+	f.aead.Seal(f.buf[:0], f.nonceBuf[:], plain, f.aad(blockN))
+	// f.buf now: [ct(logBlockSize) | tag(tagSize) | stale(nonceSize-tagSize)].
+	// Required on-disk: [ct(logBlockSize) | nonce(nonceSize) | tag(tagSize)].
+	// Move the tag first (its source range is about to be overwritten by the nonce).
+	copy(f.buf[logBlockSize+nonceSize:physBlockSize], f.buf[logBlockSize:logBlockSize+tagSize])
+	// Place the nonce into its on-disk slot.
+	copy(f.buf[logBlockSize:logBlockSize+nonceSize], f.nonceBuf[:])
+
 	m, werr := f.File.WriteAt(f.buf[:], physBlockOff(blockN))
 	if m != physBlockSize {
 		return werr
